@@ -51,4 +51,18 @@ docker run -d \
 python main.py lark=xxxxxxxx \
 feishu=xxxxxxxx
 ```
+### docker-compose.yml
+```yml
+version: "3"
+
+services:
+  ez-checkin:
+    image: crazy0x70/ez-checkin:latest
+    container_name: ez-checkin
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./config.json:/app/config.json
+    restart: unless-stopped
+```
 容器启动后会立即执行一次签到并推送结果，后续按计划任务执行。
