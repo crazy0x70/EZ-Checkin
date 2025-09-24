@@ -18,25 +18,6 @@ CHECKIN_URL = 'https://msec.nsfocus.com/backend_api/checkin/checkin'
 POINTS_URL = 'https://msec.nsfocus.com/backend_api/point/common/get'
 
 
-def load_cookie(filepath: str) -> Dict[str, str]:
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read().strip()
-        try:
-            data = json.loads(content)
-            auth = data.get('Authorization') or data.get('authorization') or ''
-            cookie = data.get('Cookie') or data.get('cookie') or ''
-            return {"Authorization": auth, "Cookie": cookie}
-        except json.JSONDecodeError:
-            headers: Dict[str, str] = {}
-            for line in content.splitlines():
-                if not line.strip():
-                    continue
-                if ':' in line:
-                    k, v = line.split(':', 1)
-                    headers[k.strip()] = v.strip()
-            return {"Authorization": headers.get('Authorization', ''), "Cookie": headers.get('Cookie', '')}
-
-
 def load_config(filepath: str) -> Dict[str, str]:
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read().strip()
@@ -44,12 +25,11 @@ def load_config(filepath: str) -> Dict[str, str]:
         obj = json.loads(content)
         return {
             'Authorization': obj.get('Authorization') or obj.get('authorization') or '',
-            'Cookie': obj.get('Cookie') or obj.get('cookie') or '',
             'FEISHU_WEBHOOK': obj.get('FEISHU_WEBHOOK') or obj.get('feishu') or obj.get('feishu_token') or '',
             'LARK_WEBHOOK': obj.get('LARK_WEBHOOK') or obj.get('lark') or obj.get('lark_token') or '',
         }
     except json.JSONDecodeError:
-        cfg: Dict[str, str] = {'Authorization': '', 'Cookie': '', 'FEISHU_WEBHOOK': '', 'LARK_WEBHOOK': ''}
+        cfg: Dict[str, str] = {'Authorization': '', 'FEISHU_WEBHOOK': '', 'LARK_WEBHOOK': ''}
         for line in content.splitlines():
             line = line.strip()
             if not line or line.startswith('#'):
@@ -63,7 +43,7 @@ def load_config(filepath: str) -> Dict[str, str]:
         return cfg
 
 
-def build_headers(authorization: str, cookie: str) -> Dict[str, str]:
+def build_headers(authorization: str) -> Dict[str, str]:
     headers: Dict[str, str] = {
         'Accept': '*/*',
         'Content-Type': 'application/json',
@@ -73,8 +53,6 @@ def build_headers(authorization: str, cookie: str) -> Dict[str, str]:
     }
     if authorization:
         headers['Authorization'] = authorization
-    if cookie:
-        headers['Cookie'] = cookie
     return headers
 
 DEFAULT_QD = """POST /backend_api/checkin/checkin HTTP/1.1
@@ -90,25 +68,6 @@ Content-Type: application/json
 
 {}
 """
-
-def load_cookie(filepath: str) -> Dict[str, str]:
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read().strip()
-        try:
-            data = json.loads(content)
-            auth = data.get('Authorization') or data.get('authorization') or ''
-            cookie = data.get('Cookie') or data.get('cookie') or ''
-            return {"Authorization": auth, "Cookie": cookie}
-        except json.JSONDecodeError:
-            headers: Dict[str, str] = {}
-            for line in content.splitlines():
-                if not line.strip():
-                    continue
-                if ':' in line:
-                    k, v = line.split(':', 1)
-                    headers[k.strip()] = v.strip()
-            return {"Authorization": headers.get('Authorization', ''), "Cookie": headers.get('Cookie', '')}
-
 
 def parse_request_file(filepath: str) -> Tuple[str, str, Dict[str, str], Optional[str]]:
     with open(filepath, 'r', encoding='utf-8') as f:
@@ -221,8 +180,6 @@ def merge_headers(base: Dict[str, str], auth_headers: Dict[str, str]) -> Dict[st
     merged = {k.strip(): v.strip() for k, v in base.items()}
     if auth_headers.get('Authorization'):
         merged['Authorization'] = auth_headers['Authorization']
-    if auth_headers.get('Cookie'):
-        merged['Cookie'] = auth_headers['Cookie']
     for hk in list(merged.keys()):
         lk = hk.lower()
         if lk in ('host', 'content-length'):
@@ -357,12 +314,10 @@ def main() -> None:
     else:
         cfg = {
             'Authorization': os.environ.get('Authorization') or os.environ.get('AUTHORIZATION') or '',
-            'Cookie': os.environ.get('Cookie') or os.environ.get('COOKIE') or '',
             'LARK_WEBHOOK': os.environ.get('LARK_WEBHOOK') or '',
             'FEISHU_WEBHOOK': os.environ.get('FEISHU_WEBHOOK') or '',
         }
     authorization = cfg.get('Authorization', '')
-    cookie_value = cfg.get('Cookie', '')
     if not args.lark:
         args.lark = cfg.get('LARK_WEBHOOK', '')
     if not args.feishu:
@@ -373,13 +328,13 @@ def main() -> None:
         args.feishu = os.environ.get('FEISHU_WEBHOOK', '')
     args.lark = normalize_webhook(args.lark, LARK_BASE)
     args.feishu = normalize_webhook(args.feishu, FEISHU_BASE)
-    if not authorization or not cookie_value:
-        msg = '未找到有效的 Authorization/Cookie（请提供 config.json 或设置环境变量）'
+    if not authorization:
+        msg = '未找到有效的 Authorization（请提供 config.json 或设置环境变量）'
         print(msg)
         send_webhook(f"[签到服务] 启动失败：{msg}", args.lark, args.feishu)
         sys.exit(1)
 
-    req_headers = build_headers(authorization, cookie_value)
+    req_headers = build_headers(authorization)
 
     def do_sign_in_flow(trigger: str) -> None:
         nonlocal req_headers
@@ -420,7 +375,7 @@ def main() -> None:
         try:
             accrued, total, qmsg = query_points(req_headers)
             if accrued is None:
-                warn = f"[积分检查] 失败，可能 Authorization/Cookie 失效：{qmsg} @ {now_str(args.tz)}"
+                warn = f"[积分检查] 失败，可能 Authorization 失效：{qmsg} @ {now_str(args.tz)}"
                 print(warn)
                 send_webhook(warn, args.lark, args.feishu)
             else:

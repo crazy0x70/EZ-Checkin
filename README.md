@@ -8,7 +8,6 @@
 ```json
 {
 "Authorization": "xxxx",
-"Cookie": "xxx",
 "LARK_WEBHOOK": "xxxxxxxx",
 "FEISHU_WEBHOOK": "xxxxxxxx"
 }
@@ -16,7 +15,6 @@
 - 文本键值对：
 ```
 Authorization=xxxx
-Cookie=xxx
 LARK_WEBHOOK=xxxxxxxx
 FEISHU_WEBHOOK=xxxxxxxx
 ```
