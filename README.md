@@ -68,13 +68,6 @@
 python main.py
 ```
 
-#### 命令行参数
-
-- `--config-file`: 指定配置文件路径（默认：./config.json）
-- `--lark`: 全局Lark webhook token或完整URL
-- `--feishu`: 全局Feishu webhook token或完整URL  
-- `--tz`: 时区设置（默认：Asia/Shanghai）
-
 ### Docker 运行
 
 ```bash
