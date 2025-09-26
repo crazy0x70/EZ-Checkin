@@ -18,6 +18,50 @@ from urllib.parse import urlparse
 CHECKIN_URL = 'https://msec.nsfocus.com/backend_api/checkin/checkin'
 POINTS_URL = 'https://msec.nsfocus.com/backend_api/point/common/get'
 
+# 积分状态存储文件
+POINTS_STATE_FILE = 'points_state.json'
+
+
+def load_points_state() -> Dict[str, Dict[str, Any]]:
+    """加载积分状态历史"""
+    if os.path.exists(POINTS_STATE_FILE):
+        try:
+            with open(POINTS_STATE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+def save_points_state(state: Dict[str, Dict[str, Any]]) -> None:
+    """保存积分状态历史"""
+    try:
+        with open(POINTS_STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except IOError as e:
+        print(f"保存积分状态失败: {e}")
+
+
+def check_points_changed(username: str, current_points: int, total_points: int) -> bool:
+    """检查积分是否发生变化"""
+    state = load_points_state()
+    user_state = state.get(username, {})
+    
+    last_current = user_state.get('current_points')
+    last_total = user_state.get('total_points')
+    
+    # 如果积分发生变化，更新状态
+    if last_current != current_points or last_total != total_points:
+        state[username] = {
+            'current_points': current_points,
+            'total_points': total_points,
+            'last_update': datetime.now().isoformat()
+        }
+        save_points_state(state)
+        return True
+    
+    return False
+
 
 def load_config(filepath: str) -> Tuple[List[Dict[str, str]], Optional[str], Optional[str]]:
     """
@@ -341,6 +385,10 @@ def do_user_sign_in(user: Dict[str, str], trigger: str, tz_name: str) -> Dict[st
         confirmed, confirm_msg = confirm_signed(req_headers, username)
         accrued, total, qmsg = query_points(req_headers, username)
         
+        # 签到完成后强制推送积分状态
+        if accrued is not None:
+            check_points_changed(username, accrued, total)
+        
         final_ok = bool(confirmed or ok)
         status_emoji = '✅' if final_ok else '❌'
         timestamp = now_str(tz_name)
@@ -396,7 +444,7 @@ def do_user_sign_in(user: Dict[str, str], trigger: str, tz_name: str) -> Dict[st
         }
 
 
-def do_user_points_check(user: Dict[str, str], tz_name: str) -> Dict[str, Any]:
+def do_user_points_check(user: Dict[str, str], tz_name: str, force_push: bool = False) -> Dict[str, Any]:
     """单个用户的积分检查"""
     username = user['username']
     authorization = user['Authorization']
@@ -411,7 +459,8 @@ def do_user_points_check(user: Dict[str, str], tz_name: str) -> Dict[str, Any]:
             'points': None,
             'total_points': None,
             'lark_webhook': lark_webhook,
-            'feishu_webhook': feishu_webhook
+            'feishu_webhook': feishu_webhook,
+            'points_changed': False
         }
     
     req_headers = build_headers(authorization)
@@ -428,20 +477,41 @@ def do_user_points_check(user: Dict[str, str], tz_name: str) -> Dict[str, Any]:
                 'points': None,
                 'total_points': None,
                 'lark_webhook': lark_webhook,
-                'feishu_webhook': feishu_webhook
+                'feishu_webhook': feishu_webhook,
+                'points_changed': False
             }
         else:
-            message = f"[{username}] [积分检查] 当前 {total}, 累计 {accrued} @ {now_str(tz_name)}"
-            print(message)
-            return {
-                'username': username,
-                'success': True,
-                'message': message,
-                'points': accrued,
-                'total_points': total,
-                'lark_webhook': lark_webhook,
-                'feishu_webhook': feishu_webhook
-            }
+            # 检查积分是否发生变化
+            points_changed = check_points_changed(username, accrued, total)
+            
+            if points_changed or force_push:
+                message = f"[{username}] [积分检查] 当前 {total}, 累计 {accrued} @ {now_str(tz_name)}"
+                if points_changed:
+                    message += " (积分已更新)"
+                print(message)
+                return {
+                    'username': username,
+                    'success': True,
+                    'message': message,
+                    'points': accrued,
+                    'total_points': total,
+                    'lark_webhook': lark_webhook,
+                    'feishu_webhook': feishu_webhook,
+                    'points_changed': points_changed
+                }
+            else:
+                # 积分未变化，只记录日志，不推送
+                print(f"[{username}] [积分检查] 积分无变化: 当前 {total}, 累计 {accrued} @ {now_str(tz_name)}")
+                return {
+                    'username': username,
+                    'success': True,
+                    'message': f"[{username}] [积分检查] 积分无变化: 当前 {total}, 累计 {accrued}",
+                    'points': accrued,
+                    'total_points': total,
+                    'lark_webhook': lark_webhook,
+                    'feishu_webhook': feishu_webhook,
+                    'points_changed': False
+                }
     except Exception as e:
         warn = f"[{username}] [积分检查] 异常：{e} @ {now_str(tz_name)}"
         print(warn)
@@ -452,7 +522,8 @@ def do_user_points_check(user: Dict[str, str], tz_name: str) -> Dict[str, Any]:
             'points': None,
             'total_points': None,
             'lark_webhook': lark_webhook,
-            'feishu_webhook': feishu_webhook
+            'feishu_webhook': feishu_webhook,
+            'points_changed': False
         }
 
 
@@ -566,39 +637,42 @@ def main() -> None:
         print(f"=== {trigger} 完成 ===\n")
 
     def do_points_check() -> None:
-        """多用户积分检查"""
+        """多用户积分检查（只在积分变更时推送）"""
         print(f"\n=== 积分检查 开始 ===")
         
         # 使用线程池并发处理所有用户
         with ThreadPoolExecutor(max_workers=min(len(users), 5)) as executor:
             # 提交所有积分检查任务
             future_to_user = {
-                executor.submit(do_user_points_check, user, args.tz): user 
+                executor.submit(do_user_points_check, user, args.tz, False): user 
                 for user in users
             }
             
             # 收集结果
             results = []
+            changed_results = []
             for future in as_completed(future_to_user):
                 result = future.result()
                 results.append(result)
                 
-                # 发送分账号推送
-                if result['lark_webhook']:
-                    send_webhook(result['message'], result['lark_webhook'], None)
-                if result['feishu_webhook']:
-                    send_webhook(result['message'], None, result['feishu_webhook'])
+                # 只在积分变更时发送分账号推送
+                if result.get('points_changed', False):
+                    changed_results.append(result)
+                    if result['lark_webhook']:
+                        send_webhook(result['message'], result['lark_webhook'], None)
+                    if result['feishu_webhook']:
+                        send_webhook(result['message'], None, result['feishu_webhook'])
         
-        # 发送统一推送
-        if args.lark or args.feishu:
-            success_count = sum(1 for r in results if r['success'])
-            total_count = len(results)
+        # 只在有积分变更时发送统一推送
+        if changed_results and (args.lark or args.feishu):
+            success_count = sum(1 for r in changed_results if r['success'])
+            total_count = len(changed_results)
             
-            summary_message = f"积分检查汇总：{success_count}/{total_count} 成功\n\n"
+            summary_message = f"积分变更通知：{success_count}/{total_count} 用户积分已更新\n\n"
             
-            for result in results:
+            for result in changed_results:
                 status_emoji = '✅' if result['success'] else '❌'
-                result_text = '查询成功' if result['success'] else '查询失败'
+                result_text = '更新成功' if result['success'] else '更新失败'
                 summary_message += f"{result['username']}：\n"
                 summary_message += f"状态：{status_emoji} {result_text}\n"
                 if result['points'] is not None:
@@ -607,11 +681,14 @@ def main() -> None:
                     summary_message += "积分情况：查询失败\n"
                 summary_message += "\n"
             
-            summary_message += f"完成时间：{now_str(args.tz)}"
+            summary_message += f"更新时间：{now_str(args.tz)}"
             
             send_webhook(summary_message, args.lark, args.feishu)
         
-        print(f"=== 积分检查 完成 ===\n")
+        if changed_results:
+            print(f"=== 积分检查完成，{len(changed_results)} 个用户积分已更新 ===\n")
+        else:
+            print(f"=== 积分检查完成，无积分变更 ===\n")
 
     # 启动时执行一次签到
     do_sign_in_flow('启动签到')
@@ -625,7 +702,8 @@ def main() -> None:
     print(f"多用户签到服务已启动，共 {len(users)} 个用户")
     print(f"时区: {args.tz}")
     print(f"定时签到: 每天 08:00")
-    print(f"积分检查: 每 10 分钟")
+    print(f"积分检查: 每 10 分钟（仅在积分变更时推送通知）")
+    print(f"推送策略: 每日签到完成后 + 积分变更时")
     try:
         while True:
             time.sleep(60)
