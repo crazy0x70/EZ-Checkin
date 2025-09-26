@@ -347,7 +347,7 @@ def do_user_sign_in(user: Dict[str, str], trigger: str, tz_name: str) -> Dict[st
         
         result_text = '签到成功' if final_ok else '签到失败'
         if accrued is not None:
-            points_text = f"积分情况：当前积分{accrued}, 累计积分{total}"
+            points_text = f"积分情况：当前积分{total}, 累计积分{accrued}"
         else:
             points_text = "积分情况：查询失败"
         
@@ -431,7 +431,7 @@ def do_user_points_check(user: Dict[str, str], tz_name: str) -> Dict[str, Any]:
                 'feishu_webhook': feishu_webhook
             }
         else:
-            message = f"[{username}] [积分检查] 当前 {accrued}, 累计 {total} @ {now_str(tz_name)}"
+            message = f"[{username}] [积分检查] 当前 {total}, 累计 {accrued} @ {now_str(tz_name)}"
             print(message)
             return {
                 'username': username,
@@ -554,7 +554,7 @@ def main() -> None:
                 summary_message += f"{result['username']}：\n"
                 summary_message += f"状态：{status_emoji} {result_text}\n"
                 if result['points'] is not None:
-                    summary_message += f"积分情况：当前积分{result['points']}, 累计积分{result['total_points']}\n"
+                    summary_message += f"积分情况：当前积分{result['total_points']}, 累计积分{result['points']}\n"
                 else:
                     summary_message += "积分情况：查询失败\n"
                 summary_message += "\n"
@@ -602,7 +602,7 @@ def main() -> None:
                 summary_message += f"{result['username']}：\n"
                 summary_message += f"状态：{status_emoji} {result_text}\n"
                 if result['points'] is not None:
-                    summary_message += f"积分情况：当前积分{result['points']}, 累计积分{result['total_points']}\n"
+                    summary_message += f"积分情况：当前积分{result['total_points']}, 累计积分{result['points']}\n"
                 else:
                     summary_message += "积分情况：查询失败\n"
                 summary_message += "\n"

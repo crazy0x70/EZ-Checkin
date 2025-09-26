@@ -1,55 +1,91 @@
-## 自动签到与积分查询服务
-功能：
-- 每日 08:00 定时签到；每 10 分钟积分查询；鉴权失效时推送提醒
-- Docker 容器化部署
-### 准备文件
-- `config.json`（支持两种格式，二选一）：
-- JSON 对象：
+## M-SEC自动签到
+
+支持多账户同时签到，支持统一推送和分账号推送的自动签到脚本。
+
+## 功能特性
+
+- ✅ 支持多账户并发签到
+- ✅ 支持统一推送和分账号推送
+- ✅ 定时签到（每天8:00）
+- ✅ 飞书/Lark通知支持
+
+## 配置格式
+
+### 分账户推送配置
+
+每个用户都有独立的webhook配置：
+
 ```json
 {
-"Authorization": "xxxx",
-"LARK_WEBHOOK": "xxxxxxxx",
-"FEISHU_WEBHOOK": "xxxxxxxx"
+  "user1": {
+    "username": "账号1",
+    "Authorization": "your_jwt_token_here",
+    "LARK_WEBHOOK": "your_lark_webhook_token"
+  },
+  "user2": {
+    "username": "账号2", 
+    "Authorization": "your_jwt_token_here",
+    "LARK_WEBHOOK": "your_lark_webhook_token"
+  },
+  "user3": {
+    "username": "账号3",
+    "Authorization": "your_jwt_token_here", 
+    "LARK_WEBHOOK": "your_lark_webhook_token"
+  }
 }
 ```
-- 文本键值对：
-```
-Authorization=xxxx
-LARK_WEBHOOK=xxxxxxxx
-FEISHU_WEBHOOK=xxxxxxxx
-```
-说明：LARK_WEBHOOK/FEISHU_WEBHOOK 可填写纯 token 或完整 URL，程序会自动规范化为：
-- Lark: `https://open.larksuite.com/open-apis/bot/v2/hook/`+token
-- 飞书: `https://open.feishu.cn/open-apis/bot/v2/hook/`+token
-### 本地运行
-```bash
-pip3 install -r requirements.txt
-python3 main.py --config-file ./config.json
 
-# 如需覆盖机器人 token：
-python main.py --config-file ./config.json lark=xxxxxxxx feishu=xxxxxxxx
+### 统一推送配置
+
+所有用户共享一个webhook配置：
+
+```json
+{
+  "user1": {
+    "username": "账号1",
+    "Authorization": "your_jwt_token_here"
+  },
+  "user2": {
+    "username": "账号2",
+    "Authorization": "your_jwt_token_here"
+  },
+  "user3": {
+    "username": "账号3", 
+    "Authorization": "your_jwt_token_here"
+  },
+  "LARK_WEBHOOK": "your_global_lark_webhook_token"
+}
 ```
-环境变量：可指定 `TZ`（时区）。
-### 配置说明
-- 默认从 `$PWD/config.json` 读取；可用 `--config-file /path/to/config.json` 指定。
-- 命令行传入的 `lark=`、`feishu=` 优先级高于 `config.json`，环境变量仅用于时区。
+
+## 使用方法
+
+### 本地运行
+
+1. 配置 `config.json` 文件，按照上述格式添加你的账户信息
+2. 运行脚本：
+
+```bash
+python main.py
+```
+
+#### 命令行参数
+
+- `--config-file`: 指定配置文件路径（默认：./config.json）
+- `--lark`: 全局Lark webhook token或完整URL
+- `--feishu`: 全局Feishu webhook token或完整URL  
+- `--tz`: 时区设置（默认：Asia/Shanghai）
+
 ### Docker 运行
+
 ```bash
 docker run -d \
 -v $(pwd)/config.json:/app/config.json \
 -e TZ=Asia/Shanghai \
 --name ez-checkin crazy0x70/ez-checkin:latest
 ```
-也可按需求以参数形式覆盖 token（容器会覆盖默认 CMD 参数）：
-```bash
-docker run -d \
--v $(pwd)/config.json:/app/config.json \
--e TZ=Asia/Shanghai \
---name ez-checkin crazy0x70/ez-checkin:latest \
-python main.py lark=xxxxxxxx \
-feishu=xxxxxxxx
-```
-### docker-compose.yml
+
+#### docker-compose.yml
+
 ```yml
 version: "3"
 
@@ -63,4 +99,17 @@ services:
       - ./config.json:/app/config.json
     restart: unless-stopped
 ```
-容器启动后会立即执行一次签到并推送结果，后续按计划任务执行。
+
+## 推送机制
+
+### 分账号推送
+- 每个用户的签到结果会发送到其独立的webhook
+- 适用于需要单独监控每个账户的场景
+
+### 统一推送
+- 所有用户的签到结果汇总后发送到一个webhook
+- 适用于统一管理多个账户的场景
+
+## 注意事项
+
+1. 建议使用Docker运行以确保稳定性。
