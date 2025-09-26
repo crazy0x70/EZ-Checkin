@@ -4,8 +4,9 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -18,17 +19,41 @@ CHECKIN_URL = 'https://msec.nsfocus.com/backend_api/checkin/checkin'
 POINTS_URL = 'https://msec.nsfocus.com/backend_api/point/common/get'
 
 
-def load_config(filepath: str) -> Dict[str, str]:
+def load_config(filepath: str) -> Tuple[List[Dict[str, str]], Optional[str], Optional[str]]:
+    """
+    加载配置文件，支持多账户格式
+    返回: (用户列表, 全局LARK_WEBHOOK, 全局FEISHU_WEBHOOK)
+    """
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read().strip()
+    
     try:
         obj = json.loads(content)
-        return {
-            'Authorization': obj.get('Authorization') or obj.get('authorization') or '',
-            'FEISHU_WEBHOOK': obj.get('FEISHU_WEBHOOK') or obj.get('feishu') or obj.get('feishu_token') or '',
-            'LARK_WEBHOOK': obj.get('LARK_WEBHOOK') or obj.get('lark') or obj.get('lark_token') or '',
-        }
+        users = []
+        global_lark = None
+        global_feishu = None
+        
+        # 检查是否有全局webhook配置
+        if 'LARK_WEBHOOK' in obj:
+            global_lark = obj['LARK_WEBHOOK']
+        if 'FEISHU_WEBHOOK' in obj:
+            global_feishu = obj['FEISHU_WEBHOOK']
+        
+        # 处理用户配置
+        for key, value in obj.items():
+            if key.startswith('user') and isinstance(value, dict):
+                user_config = {
+                    'username': value.get('username', f'用户{len(users)+1}'),
+                    'Authorization': value.get('Authorization') or value.get('authorization') or '',
+                    'LARK_WEBHOOK': value.get('LARK_WEBHOOK') or global_lark or '',
+                    'FEISHU_WEBHOOK': value.get('FEISHU_WEBHOOK') or global_feishu or '',
+                }
+                users.append(user_config)
+        
+        return users, global_lark, global_feishu
+        
     except json.JSONDecodeError:
+        # 兼容旧格式
         cfg: Dict[str, str] = {'Authorization': '', 'FEISHU_WEBHOOK': '', 'LARK_WEBHOOK': ''}
         for line in content.splitlines():
             line = line.strip()
@@ -40,7 +65,18 @@ def load_config(filepath: str) -> Dict[str, str]:
                 val = v.strip()
                 if key in cfg:
                     cfg[key] = val
-        return cfg
+        
+        # 转换为新格式
+        if cfg['Authorization']:
+            users = [{
+                'username': '默认用户',
+                'Authorization': cfg['Authorization'],
+                'LARK_WEBHOOK': cfg['LARK_WEBHOOK'],
+                'FEISHU_WEBHOOK': cfg['FEISHU_WEBHOOK'],
+            }]
+            return users, cfg['LARK_WEBHOOK'], cfg['FEISHU_WEBHOOK']
+        
+        return [], None, None
 
 
 def build_headers(authorization: str) -> Dict[str, str]:
@@ -214,21 +250,21 @@ def try_json(resp: requests.Response) -> Optional[Dict[str, Any]]:
         return None
 
 
-def sign_in(req_headers: Dict[str, str]) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+def sign_in(req_headers: Dict[str, str], username: str = "") -> Tuple[bool, str, Optional[Dict[str, Any]]]:
     resp = perform_request('POST', CHECKIN_URL, req_headers, json_body={})
     j = try_json(resp)
     success = False
-    msg = f"Sign-in HTTP {resp.status_code}"
+    msg = f"[{username}] Sign-in HTTP {resp.status_code}" if username else f"Sign-in HTTP {resp.status_code}"
     if j:
         status = j.get('status')
         message = j.get('message') or ''
         data = j.get('data')
-        msg = f"Sign-in status={status} message={message}"
+        msg = f"[{username}] Sign-in status={status} message={message}" if username else f"Sign-in status={status} message={message}"
         success = (status == 200) or ('成功' in str(message))
     return success, msg, j
 
 
-def confirm_signed(req_headers: Dict[str, str]) -> Tuple[bool, str]:
+def confirm_signed(req_headers: Dict[str, str], username: str = "") -> Tuple[bool, str]:
     delays = [1.5, 3.0, 5.0]
     attempt = 0
     last_msg = ''
@@ -241,30 +277,35 @@ def confirm_signed(req_headers: Dict[str, str]) -> Tuple[bool, str]:
             data = j.get('data')
             if status == 400 and ('已经签到' in str(data) or '已经签到' in message):
                 txt = str(data or message)
-                return True, f"已签到：{txt}"
+                prefix = f"[{username}] " if username else ""
+                return True, f"{prefix}已签到：{txt}"
             if status == 429:
-                last_msg = f"确认响应 status=429 message={message or '请求过于频繁'}"
+                last_msg = f"[{username}] 确认响应 status=429 message={message or '请求过于频繁'}" if username else f"确认响应 status=429 message={message or '请求过于频繁'}"
             else:
-                return False, f"确认响应 status={status} message={message}"
+                prefix = f"[{username}] " if username else ""
+                return False, f"{prefix}确认响应 status={status} message={message}"
         else:
             if resp.status_code == 429:
-                last_msg = f"Confirm HTTP 429"
+                last_msg = f"[{username}] Confirm HTTP 429" if username else f"Confirm HTTP 429"
             else:
-                return False, f"Confirm HTTP {resp.status_code}"
+                prefix = f"[{username}] " if username else ""
+                return False, f"{prefix}Confirm HTTP {resp.status_code}"
         if attempt >= len(delays):
-            return False, last_msg or '确认失败'
+            prefix = f"[{username}] " if username else ""
+            return False, last_msg or f'{prefix}确认失败'
         time.sleep(delays[attempt])
         attempt += 1
 
 
-def query_points(req_headers: Dict[str, str]) -> Tuple[Optional[int], Optional[int], str]:
+def query_points(req_headers: Dict[str, str], username: str = "") -> Tuple[Optional[int], Optional[int], str]:
     resp = perform_request('POST', POINTS_URL, req_headers, json_body={})
     j = try_json(resp)
     if j and j.get('status') == 200 and isinstance(j.get('data'), dict):
         accrued = j['data'].get('accrued')
         total = j['data'].get('total')
         return accrued, total, 'OK'
-    return None, None, f"Query failed: HTTP {resp.status_code} body={resp.text[:200]}"
+    prefix = f"[{username}] " if username else ""
+    return None, None, f"{prefix}Query failed: HTTP {resp.status_code} body={resp.text[:200]}"
 
 
 def now_str(tz_name: str) -> str:
@@ -272,11 +313,154 @@ def now_str(tz_name: str) -> str:
     return datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S %Z')
 
 
+def do_user_sign_in(user: Dict[str, str], trigger: str, tz_name: str) -> Dict[str, Any]:
+    """单个用户的签到流程"""
+    username = user['username']
+    authorization = user['Authorization']
+    lark_webhook = user.get('LARK_WEBHOOK', '')
+    feishu_webhook = user.get('FEISHU_WEBHOOK', '')
+    
+    if not authorization:
+        error_msg = f"[{username}] 未找到有效的 Authorization"
+        print(error_msg)
+        return {
+            'username': username,
+            'success': False,
+            'message': error_msg,
+            'points': None,
+            'total_points': None,
+            'lark_webhook': lark_webhook,
+            'feishu_webhook': feishu_webhook
+        }
+    
+    req_headers = build_headers(authorization)
+    
+    try:
+        ok, first_msg, first_json = sign_in(req_headers, username)
+        time.sleep(1.2)
+        confirmed, confirm_msg = confirm_signed(req_headers, username)
+        accrued, total, qmsg = query_points(req_headers, username)
+        
+        final_ok = bool(confirmed or ok)
+        status_emoji = '✅' if final_ok else '❌'
+        timestamp = now_str(tz_name)
+        
+        result_text = '签到成功' if final_ok else '签到失败'
+        if accrued is not None:
+            points_text = f"积分情况：当前积分{accrued}, 累计积分{total}"
+        else:
+            points_text = "积分情况：查询失败"
+        
+        message = "\n".join([
+            f"用户：{username}",
+            f"状态：{status_emoji} {result_text}",
+            points_text,
+            f"签到时间：{timestamp}",
+        ])
+        
+        print(message)
+        
+        return {
+            'username': username,
+            'success': final_ok,
+            'message': message,
+            'points': accrued,
+            'total_points': total,
+            'lark_webhook': lark_webhook,
+            'feishu_webhook': feishu_webhook
+        }
+        
+    except requests.RequestException as e:
+        err = f"[{username}] [{trigger}] 网络请求错误: {e} @ {now_str(tz_name)}"
+        print(err)
+        return {
+            'username': username,
+            'success': False,
+            'message': err,
+            'points': None,
+            'total_points': None,
+            'lark_webhook': lark_webhook,
+            'feishu_webhook': feishu_webhook
+        }
+    except Exception as e:
+        err = f"[{username}] [{trigger}] 程序错误: {e} @ {now_str(tz_name)}"
+        print(err)
+        return {
+            'username': username,
+            'success': False,
+            'message': err,
+            'points': None,
+            'total_points': None,
+            'lark_webhook': lark_webhook,
+            'feishu_webhook': feishu_webhook
+        }
+
+
+def do_user_points_check(user: Dict[str, str], tz_name: str) -> Dict[str, Any]:
+    """单个用户的积分检查"""
+    username = user['username']
+    authorization = user['Authorization']
+    lark_webhook = user.get('LARK_WEBHOOK', '')
+    feishu_webhook = user.get('FEISHU_WEBHOOK', '')
+    
+    if not authorization:
+        return {
+            'username': username,
+            'success': False,
+            'message': f"[{username}] 未找到有效的 Authorization",
+            'points': None,
+            'total_points': None,
+            'lark_webhook': lark_webhook,
+            'feishu_webhook': feishu_webhook
+        }
+    
+    req_headers = build_headers(authorization)
+    
+    try:
+        accrued, total, qmsg = query_points(req_headers, username)
+        if accrued is None:
+            warn = f"[{username}] [积分检查] 失败，可能 Authorization 失效：{qmsg} @ {now_str(tz_name)}"
+            print(warn)
+            return {
+                'username': username,
+                'success': False,
+                'message': warn,
+                'points': None,
+                'total_points': None,
+                'lark_webhook': lark_webhook,
+                'feishu_webhook': feishu_webhook
+            }
+        else:
+            message = f"[{username}] [积分检查] 当前 {accrued}, 累计 {total} @ {now_str(tz_name)}"
+            print(message)
+            return {
+                'username': username,
+                'success': True,
+                'message': message,
+                'points': accrued,
+                'total_points': total,
+                'lark_webhook': lark_webhook,
+                'feishu_webhook': feishu_webhook
+            }
+    except Exception as e:
+        warn = f"[{username}] [积分检查] 异常：{e} @ {now_str(tz_name)}"
+        print(warn)
+        return {
+            'username': username,
+            'success': False,
+            'message': warn,
+            'points': None,
+            'total_points': None,
+            'lark_webhook': lark_webhook,
+            'feishu_webhook': feishu_webhook
+        }
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Daily sign-in and points checker with Lark/Feishu notifications')
+    parser = argparse.ArgumentParser(description='Multi-user daily sign-in and points checker with Lark/Feishu notifications')
     parser.add_argument('--config-file', default=os.path.join(os.getcwd(), 'config.json'), help='Path to config.json (default: $PWD/config.json)')
-    parser.add_argument('--lark', default='', help='Lark webhook token or full URL (overrides config)')
-    parser.add_argument('--feishu', default='', help='Feishu webhook token or full URL (overrides config)')
+    parser.add_argument('--lark', default='', help='Global Lark webhook token or full URL (overrides config)')
+    parser.add_argument('--feishu', default='', help='Global Feishu webhook token or full URL (overrides config)')
     parser.add_argument('--tz', default=os.environ.get('TZ', 'Asia/Shanghai'), help='Timezone, default Asia/Shanghai')
     args, unknown = parser.parse_known_args()
 
@@ -310,89 +494,138 @@ def main() -> None:
     FEISHU_BASE = 'https://open.feishu.cn/open-apis/bot/v2/hook/'
 
     if os.path.exists(args.config_file):
-        cfg = load_config(args.config_file)
+        users, global_lark, global_feishu = load_config(args.config_file)
     else:
-        cfg = {
-            'Authorization': os.environ.get('Authorization') or os.environ.get('AUTHORIZATION') or '',
-            'LARK_WEBHOOK': os.environ.get('LARK_WEBHOOK') or '',
-            'FEISHU_WEBHOOK': os.environ.get('FEISHU_WEBHOOK') or '',
-        }
-    authorization = cfg.get('Authorization', '')
+        users = []
+        global_lark = None
+        global_feishu = None
+
+    if not users:
+        msg = '未找到有效的用户配置（请提供 config.json 或设置环境变量）'
+        print(msg)
+        sys.exit(1)
+
+    # 处理全局webhook配置
     if not args.lark:
-        args.lark = cfg.get('LARK_WEBHOOK', '')
+        args.lark = global_lark or ''
     if not args.feishu:
-        args.feishu = cfg.get('FEISHU_WEBHOOK', '')
+        args.feishu = global_feishu or ''
     if not args.lark:
         args.lark = os.environ.get('LARK_WEBHOOK', '')
     if not args.feishu:
         args.feishu = os.environ.get('FEISHU_WEBHOOK', '')
     args.lark = normalize_webhook(args.lark, LARK_BASE)
     args.feishu = normalize_webhook(args.feishu, FEISHU_BASE)
-    if not authorization:
-        msg = '未找到有效的 Authorization（请提供 config.json 或设置环境变量）'
-        print(msg)
-        send_webhook(f"[签到服务] 启动失败：{msg}", args.lark, args.feishu)
-        sys.exit(1)
-
-    req_headers = build_headers(authorization)
 
     def do_sign_in_flow(trigger: str) -> None:
-        nonlocal req_headers
-        try:
-            ok, first_msg, first_json = sign_in(req_headers)
-            time.sleep(1.2)
-            confirmed, confirm_msg = confirm_signed(req_headers)
-            accrued, total, qmsg = query_points(req_headers)
-
-            final_ok = bool(confirmed or ok)
-            status_emoji = '✅' if final_ok else '❌'
-            timestamp = now_str(args.tz)
-
-            result_text = '签到成功' if final_ok else '签到失败'
-            if accrued is not None:
-                points_text = f"积分情况：当前积分{accrued}, 累计积分{total}"
-            else:
-                points_text = "积分情况：查询失败"
-            note = "\n".join([
-                f"状态：{status_emoji} {result_text}",
-                points_text,
-                f"签到时间：{timestamp}",
-            ])
-
-            print(note)
-            send_webhook(note, args.lark, args.feishu)
-        except requests.RequestException as e:
-            err = f"[{trigger}] 网络请求错误: {e} @ {now_str(args.tz)}"
-            print(err)
-            send_webhook(err, args.lark, args.feishu)
-        except Exception as e:
-            err = f"[{trigger}] 程序错误: {e} @ {now_str(args.tz)}"
-            print(err)
-            send_webhook(err, args.lark, args.feishu)
+        """多用户签到流程"""
+        print(f"\n=== {trigger} 开始 ===")
+        
+        # 使用线程池并发处理所有用户
+        with ThreadPoolExecutor(max_workers=min(len(users), 5)) as executor:
+            # 提交所有签到任务
+            future_to_user = {
+                executor.submit(do_user_sign_in, user, trigger, args.tz): user 
+                for user in users
+            }
+            
+            # 收集结果
+            results = []
+            for future in as_completed(future_to_user):
+                result = future.result()
+                results.append(result)
+                
+                # 发送分账号推送
+                if result['lark_webhook']:
+                    send_webhook(result['message'], result['lark_webhook'], None)
+                if result['feishu_webhook']:
+                    send_webhook(result['message'], None, result['feishu_webhook'])
+        
+        # 发送统一推送
+        if args.lark or args.feishu:
+            success_count = sum(1 for r in results if r['success'])
+            total_count = len(results)
+            
+            summary_message = f"签到汇总：{success_count}/{total_count} 成功\n\n"
+            
+            for result in results:
+                status_emoji = '✅' if result['success'] else '❌'
+                result_text = '签到成功' if result['success'] else '签到失败'
+                summary_message += f"{result['username']}：\n"
+                summary_message += f"状态：{status_emoji} {result_text}\n"
+                if result['points'] is not None:
+                    summary_message += f"积分情况：当前积分{result['points']}, 累计积分{result['total_points']}\n"
+                else:
+                    summary_message += "积分情况：查询失败\n"
+                summary_message += "\n"
+            
+            summary_message += f"完成时间：{now_str(args.tz)}"
+            
+            send_webhook(summary_message, args.lark, args.feishu)
+        
+        print(f"=== {trigger} 完成 ===\n")
 
     def do_points_check() -> None:
-        nonlocal req_headers
-        try:
-            accrued, total, qmsg = query_points(req_headers)
-            if accrued is None:
-                warn = f"[积分检查] 失败，可能 Authorization 失效：{qmsg} @ {now_str(args.tz)}"
-                print(warn)
-                send_webhook(warn, args.lark, args.feishu)
-            else:
-                print(f"[积分检查] 当前 {accrued}, 累计 {total} @ {now_str(args.tz)}")
-        except Exception as e:
-            warn = f"[积分检查] 异常：{e} @ {now_str(args.tz)}"
-            print(warn)
-            send_webhook(warn, args.lark, args.feishu)
+        """多用户积分检查"""
+        print(f"\n=== 积分检查 开始 ===")
+        
+        # 使用线程池并发处理所有用户
+        with ThreadPoolExecutor(max_workers=min(len(users), 5)) as executor:
+            # 提交所有积分检查任务
+            future_to_user = {
+                executor.submit(do_user_points_check, user, args.tz): user 
+                for user in users
+            }
+            
+            # 收集结果
+            results = []
+            for future in as_completed(future_to_user):
+                result = future.result()
+                results.append(result)
+                
+                # 发送分账号推送
+                if result['lark_webhook']:
+                    send_webhook(result['message'], result['lark_webhook'], None)
+                if result['feishu_webhook']:
+                    send_webhook(result['message'], None, result['feishu_webhook'])
+        
+        # 发送统一推送
+        if args.lark or args.feishu:
+            success_count = sum(1 for r in results if r['success'])
+            total_count = len(results)
+            
+            summary_message = f"积分检查汇总：{success_count}/{total_count} 成功\n\n"
+            
+            for result in results:
+                status_emoji = '✅' if result['success'] else '❌'
+                result_text = '查询成功' if result['success'] else '查询失败'
+                summary_message += f"{result['username']}：\n"
+                summary_message += f"状态：{status_emoji} {result_text}\n"
+                if result['points'] is not None:
+                    summary_message += f"积分情况：当前积分{result['points']}, 累计积分{result['total_points']}\n"
+                else:
+                    summary_message += "积分情况：查询失败\n"
+                summary_message += "\n"
+            
+            summary_message += f"完成时间：{now_str(args.tz)}"
+            
+            send_webhook(summary_message, args.lark, args.feishu)
+        
+        print(f"=== 积分检查 完成 ===\n")
 
+    # 启动时执行一次签到
     do_sign_in_flow('启动签到')
 
+    # 设置定时任务
     sched = BackgroundScheduler(timezone=timezone(args.tz))
     sched.add_job(lambda: do_sign_in_flow('定时签到'), CronTrigger(hour=8, minute=0))
     sched.add_job(do_points_check, IntervalTrigger(minutes=10))
     sched.start()
 
-    print(f"Scheduler started. TZ={args.tz}")
+    print(f"多用户签到服务已启动，共 {len(users)} 个用户")
+    print(f"时区: {args.tz}")
+    print(f"定时签到: 每天 08:00")
+    print(f"积分检查: 每 10 分钟")
     try:
         while True:
             time.sleep(60)
