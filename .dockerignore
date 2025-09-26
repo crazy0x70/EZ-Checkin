@@ -1,0 +1,9 @@
+config.json
+cookie.json
+qd.txt
+cx.txt
+.git
+.gitignore
+__pycache__
+*.pyc
+
