@@ -5,39 +5,44 @@
 ## 功能特性
 
 - ✅ 支持多账户并发签到
-- ✅ 支持统一推送和分账号推送
+- ✅ 支持飞书/Lark通知统一推送
+- ✅ 智能积分检查（每10分钟检查，仅在积分变更时推送）
 - ✅ 定时签到（每天8:00）
 - ✅ 飞书/Lark通知支持
+- ✅ 支持账号密码登录 + [云码验证码识别](https://console.jfbym.com/register/TG120148)
+- ✅ 自动Token管理和更新
 
 ## 配置格式
 
-### 分账户推送配置
+### 账号密码登录配置（推荐）
 
-每个用户都有独立的webhook配置：
+使用账号密码登录，支持[云码验证码识别](https://console.jfbym.com/register/TG120148)：
 
 ```json
 {
   "user1": {
-    "username": "账号1",
-    "Authorization": "your_jwt_token_here",
-    "LARK_WEBHOOK": "your_lark_webhook_token"
+    "username": "账号1用户名",
+    "password": "账号1密码",
+    "Authorization": "留空即可"
   },
   "user2": {
-    "username": "账号2", 
-    "Authorization": "your_jwt_token_here",
-    "LARK_WEBHOOK": "your_lark_webhook_token"
+    "username": "账号2用户名",
+    "password": "账号2密码",
+    "Authorization": ""
   },
   "user3": {
-    "username": "账号3",
-    "Authorization": "your_jwt_token_here", 
-    "LARK_WEBHOOK": "your_lark_webhook_token"
-  }
+    "username": "账号3用户名",
+    "password": "账号3密码",
+    "Authorization": ""
+  },
+  "CAPTCHA_TOKEN": "云码token",
+  "LARK_WEBHOOK": "your_global_lark_webhook_token"
 }
 ```
 
-### 统一推送配置
+### Token认证配置
 
-所有用户共享一个webhook配置：
+使用已有的Authorization Token：
 
 ```json
 {
@@ -67,6 +72,12 @@
 ```bash
 python main.py
 ```
+#### 命令行参数
+
+- `--config-file`: 指定配置文件路径（默认：./config.json）
+- `--lark`: 全局Lark webhook token或完整URL
+- `--feishu`: 全局Feishu webhook token或完整URL  
+- `--tz`: 时区设置（默认：Asia/Shanghai）
 
 ### Docker 运行
 
@@ -95,14 +106,33 @@ services:
 
 ## 推送机制
 
-### 分账号推送
-- 每个用户的签到结果会发送到其独立的webhook
-- 适用于需要单独监控每个账户的场景
+### 推送时机
+- **每日签到完成后**：所有用户的签到结果和积分状态
+- **积分变更时**：当检测到用户积分发生变化时推送
 
 ### 统一推送
 - 所有用户的签到结果汇总后发送到一个webhook
 - 适用于统一管理多个账户的场景
 
+### 智能推送策略
+- 每10分钟检查积分状态，但只在积分变更时才推送通知
+- 避免频繁的重复通知，减少消息干扰
+- 自动记录积分历史，准确检测变化
+
+### 登录方式
+- **账号密码登录**：配置用户名、密码和云码Token，自动识别验证码登录
+- **Token认证**：使用已有的Authorization Token直接登录
+- **智能Token管理**：
+  - 登录成功后自动保存Token到配置文件
+  - 优先使用保存的Token进行操作
+  - 只有在Token失效时才重新登录
+  - 自动检测Token失效并刷新，无需手动干预
+- **顺序登录机制**：
+  - 启动时顺序登录所有需要登录的用户
+  - 每个用户登录间隔5秒以上，避免并发登录冲突
+  - 防止验证码获取失败，提高登录成功率
+
 ## 注意事项
 
-1. 建议使用Docker运行以确保稳定性。
+1. Authorization token需要定期更新
+2. 建议使用Docker运行以确保稳定性

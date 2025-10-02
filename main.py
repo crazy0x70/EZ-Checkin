@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 
 CHECKIN_URL = 'https://msec.nsfocus.com/backend_api/checkin/checkin'
 POINTS_URL = 'https://msec.nsfocus.com/backend_api/point/common/get'
+CAPTCHA_URL = 'https://msec.nsfocus.com/backend_api/account/captcha'
+LOGIN_URL = 'https://msec.nsfocus.com/backend_api/account/login'
 
 # 积分状态存储文件
 POINTS_STATE_FILE = 'points_state.json'
@@ -63,10 +65,136 @@ def check_points_changed(username: str, current_points: int, total_points: int) 
     return False
 
 
-def load_config(filepath: str) -> Tuple[List[Dict[str, str]], Optional[str], Optional[str]]:
+def verify_captcha(token: str, captcha_image: str) -> Optional[str]:
+    """使用云码识别验证码"""
+    url = "http://api.jfbym.com/api/YmServer/customApi"
+    data = {
+        "token": token,
+        "type": 10103,  # 验证码类型
+        "image": captcha_image
+    }
+    headers = {
+        "Content-Type": "application/json"
+    }
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=10).json()
+        if response.get('code') == 10000:
+            captcha_result = response['data']['data']
+            if captcha_result and len(captcha_result) == 5:
+                return captcha_result
+        return None
+    except Exception as e:
+        print(f"验证码识别失败: {e}")
+        return None
+
+
+def get_captcha() -> Tuple[Optional[str], Optional[str]]:
+    """获取验证码"""
+    try:
+        resp = requests.post(CAPTCHA_URL, headers=build_headers(""), json={}, timeout=10)
+        data = resp.json().get('data')
+        if data:
+            captcha_id = data.get('id')
+            captcha_img = data.get('captcha', '').split(',')[-1] if ',' in data.get('captcha', '') else data.get('captcha')
+            return captcha_id, captcha_img
+        return None, None
+    except Exception as e:
+        print(f"获取验证码失败: {e}")
+        return None, None
+
+
+def login_with_password(username: str, password: str, captcha_token: str) -> Optional[str]:
+    """使用账号密码登录"""
+    for attempt in range(1, 11):
+        print(f"[{username}] 第{attempt}次登录尝试")
+        time.sleep(2)
+        
+        # 获取验证码
+        captcha_id, captcha_img = get_captcha()
+        if not captcha_id or not captcha_img:
+            print(f"[{username}] 获取验证码失败")
+            continue
+        
+        # 识别验证码
+        captcha_result = verify_captcha(captcha_token, captcha_img)
+        if not captcha_result:
+            print(f"[{username}] 验证码识别失败")
+            continue
+        
+        print(f"[{username}] 验证码识别成功: {captcha_result}")
+        
+        # 尝试登录
+        login_data = {
+            "captcha_answer": captcha_result,
+            "captcha_id": captcha_id,
+            "password": password,
+            "username": username
+        }
+        
+        try:
+            resp = requests.post(LOGIN_URL, headers=build_headers(""), json=login_data, timeout=10)
+            auth_data = resp.json()
+            
+            if auth_data.get('status') == 200:
+                token = auth_data['data']['token']
+                print(f"[{username}] 登录成功")
+                return token
+            else:
+                print(f"[{username}] 登录失败: {auth_data.get('message', '未知错误')}")
+                continue
+        except Exception as e:
+            print(f"[{username}] 登录请求失败: {e}")
+            continue
+    
+    print(f"[{username}] 登录失败，已尝试10次")
+    return None
+
+
+def login_users_sequentially(users: List[Dict[str, str]], captcha_token: Optional[str], config_file: str) -> None:
+    """顺序登录所有需要登录的用户"""
+    if not captcha_token:
+        return
+    
+    users_need_login = []
+    for user in users:
+        # 需要登录的情况：没有Token但有密码，或者Token为空但有密码
+        if user['password'] and (not user['Authorization'] or user['Authorization'].strip() == ''):
+            users_need_login.append(user)
+    
+    if not users_need_login:
+        print("所有用户都有有效的Token，无需登录")
+        return
+    
+    print(f"\n=== 开始顺序登录 {len(users_need_login)} 个用户 ===")
+    
+    for i, user in enumerate(users_need_login):
+        username = user['username']
+        password = user['password']
+        
+        print(f"[{i+1}/{len(users_need_login)}] 开始登录用户: {username}")
+        
+        # 登录间隔5秒以上
+        if i > 0:
+            print(f"等待5秒后继续下一个用户登录...")
+            time.sleep(5)
+        
+        new_token = login_with_password(username, password, captcha_token)
+        if new_token:
+            # 更新配置文件中的token
+            update_user_token(config_file, username, new_token)
+            # 更新内存中的用户配置
+            user['Authorization'] = new_token
+            print(f"[{username}] 登录成功，Token已保存")
+        else:
+            print(f"[{username}] 登录失败")
+    
+    print(f"=== 用户登录完成 ===\n")
+
+
+def load_config(filepath: str) -> Tuple[List[Dict[str, str]], Optional[str], Optional[str], Optional[str]]:
     """
     加载配置文件，支持多账户格式
-    返回: (用户列表, 全局LARK_WEBHOOK, 全局FEISHU_WEBHOOK)
+    返回: (用户列表, 全局LARK_WEBHOOK, 全局FEISHU_WEBHOOK, 云码TOKEN)
     """
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read().strip()
@@ -76,12 +204,15 @@ def load_config(filepath: str) -> Tuple[List[Dict[str, str]], Optional[str], Opt
         users = []
         global_lark = None
         global_feishu = None
+        captcha_token = None
         
-        # 检查是否有全局webhook配置
+        # 检查是否有全局webhook配置和云码token
         if 'LARK_WEBHOOK' in obj:
             global_lark = obj['LARK_WEBHOOK']
         if 'FEISHU_WEBHOOK' in obj:
             global_feishu = obj['FEISHU_WEBHOOK']
+        if 'CAPTCHA_TOKEN' in obj:
+            captcha_token = obj['CAPTCHA_TOKEN']
         
         # 处理用户配置
         for key, value in obj.items():
@@ -89,12 +220,13 @@ def load_config(filepath: str) -> Tuple[List[Dict[str, str]], Optional[str], Opt
                 user_config = {
                     'username': value.get('username', f'用户{len(users)+1}'),
                     'Authorization': value.get('Authorization') or value.get('authorization') or '',
+                    'password': value.get('password', ''),
                     'LARK_WEBHOOK': value.get('LARK_WEBHOOK') or global_lark or '',
                     'FEISHU_WEBHOOK': value.get('FEISHU_WEBHOOK') or global_feishu or '',
                 }
                 users.append(user_config)
         
-        return users, global_lark, global_feishu
+        return users, global_lark, global_feishu, captcha_token
         
     except json.JSONDecodeError:
         # 兼容旧格式
@@ -115,12 +247,80 @@ def load_config(filepath: str) -> Tuple[List[Dict[str, str]], Optional[str], Opt
             users = [{
                 'username': '默认用户',
                 'Authorization': cfg['Authorization'],
+                'password': '',
                 'LARK_WEBHOOK': cfg['LARK_WEBHOOK'],
                 'FEISHU_WEBHOOK': cfg['FEISHU_WEBHOOK'],
             }]
-            return users, cfg['LARK_WEBHOOK'], cfg['FEISHU_WEBHOOK']
+            return users, cfg['LARK_WEBHOOK'], cfg['FEISHU_WEBHOOK'], None
         
-        return [], None, None
+        return [], None, None, None
+
+
+def update_user_token(filepath: str, username: str, new_token: str) -> None:
+    """更新用户token到配置文件"""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        # 查找并更新对应用户的token
+        for key, value in config.items():
+            if key.startswith('user') and isinstance(value, dict) and value.get('username') == username:
+                value['Authorization'] = new_token
+                break
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        
+        print(f"[{username}] Token已更新到配置文件")
+    except Exception as e:
+        print(f"[{username}] 更新Token失败: {e}")
+
+
+def get_user_authorization(user: Dict[str, str], captcha_token: Optional[str], config_file: str) -> str:
+    """获取用户Authorization，优先使用保存的token，失败时尝试登录"""
+    username = user['username']
+    password = user['password']
+    saved_token = user['Authorization']
+    
+    # 如果有保存的token，先尝试使用
+    if saved_token:
+        print(f"[{username}] 使用保存的Token进行签到")
+        return saved_token
+    
+    # 如果没有保存的token，尝试使用账号密码登录
+    if password and captcha_token:
+        print(f"[{username}] 无保存的Token，尝试使用账号密码登录")
+        new_token = login_with_password(username, password, captcha_token)
+        if new_token:
+            # 更新配置文件中的token
+            update_user_token(config_file, username, new_token)
+            return new_token
+        else:
+            print(f"[{username}] 登录失败，无法获取Token")
+            return ""
+    else:
+        print(f"[{username}] 缺少密码或云码Token，无法登录")
+        return ""
+
+
+def refresh_user_authorization(user: Dict[str, str], captcha_token: Optional[str], config_file: str) -> str:
+    """刷新用户Authorization，使用账号密码重新登录"""
+    username = user['username']
+    password = user['password']
+    
+    if password and captcha_token:
+        print(f"[{username}] Token失效，尝试重新登录")
+        new_token = login_with_password(username, password, captcha_token)
+        if new_token:
+            # 更新配置文件中的token
+            update_user_token(config_file, username, new_token)
+            return new_token
+        else:
+            print(f"[{username}] 重新登录失败")
+            return ""
+    else:
+        print(f"[{username}] 缺少密码或云码Token，无法重新登录")
+        return ""
 
 
 def build_headers(authorization: str) -> Dict[str, str]:
@@ -357,15 +557,16 @@ def now_str(tz_name: str) -> str:
     return datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S %Z')
 
 
-def do_user_sign_in(user: Dict[str, str], trigger: str, tz_name: str) -> Dict[str, Any]:
+def do_user_sign_in(user: Dict[str, str], trigger: str, tz_name: str, captcha_token: Optional[str], config_file: str) -> Dict[str, Any]:
     """单个用户的签到流程"""
     username = user['username']
-    authorization = user['Authorization']
     lark_webhook = user.get('LARK_WEBHOOK', '')
     feishu_webhook = user.get('FEISHU_WEBHOOK', '')
     
+    # 获取Authorization（优先使用保存的token）
+    authorization = user['Authorization']
     if not authorization:
-        error_msg = f"[{username}] 未找到有效的 Authorization"
+        error_msg = f"[{username}] 无有效的 Authorization"
         print(error_msg)
         return {
             'username': username,
@@ -381,6 +582,24 @@ def do_user_sign_in(user: Dict[str, str], trigger: str, tz_name: str) -> Dict[st
     
     try:
         ok, first_msg, first_json = sign_in(req_headers, username)
+        
+        # 检查Authorization是否失效
+        if not ok and first_json and first_json.get('status') in [401, 403]:
+            print(f"[{username}] Authorization失效，等待重新登录")
+            # 注意：这里不立即重新登录，而是标记需要重新登录
+            # 实际的重新登录会在下次启动时进行
+            error_msg = f"[{username}] Authorization失效，需要重新登录"
+            print(error_msg)
+            return {
+                'username': username,
+                'success': False,
+                'message': error_msg,
+                'points': None,
+                'total_points': None,
+                'lark_webhook': lark_webhook,
+                'feishu_webhook': feishu_webhook
+            }
+        
         time.sleep(1.2)
         confirmed, confirm_msg = confirm_signed(req_headers, username)
         accrued, total, qmsg = query_points(req_headers, username)
@@ -444,18 +663,19 @@ def do_user_sign_in(user: Dict[str, str], trigger: str, tz_name: str) -> Dict[st
         }
 
 
-def do_user_points_check(user: Dict[str, str], tz_name: str, force_push: bool = False) -> Dict[str, Any]:
+def do_user_points_check(user: Dict[str, str], tz_name: str, captcha_token: Optional[str], config_file: str, force_push: bool = False) -> Dict[str, Any]:
     """单个用户的积分检查"""
     username = user['username']
-    authorization = user['Authorization']
     lark_webhook = user.get('LARK_WEBHOOK', '')
     feishu_webhook = user.get('FEISHU_WEBHOOK', '')
     
+    # 获取Authorization（优先使用保存的token）
+    authorization = user['Authorization']
     if not authorization:
         return {
             'username': username,
             'success': False,
-            'message': f"[{username}] 未找到有效的 Authorization",
+            'message': f"[{username}] 无有效的 Authorization",
             'points': None,
             'total_points': None,
             'lark_webhook': lark_webhook,
@@ -467,8 +687,27 @@ def do_user_points_check(user: Dict[str, str], tz_name: str, force_push: bool = 
     
     try:
         accrued, total, qmsg = query_points(req_headers, username)
+        
+        # 检查Authorization是否失效（积分查询失败且返回401/403）
+        if accrued is None and ('401' in qmsg or '403' in qmsg):
+            print(f"[{username}] [积分检查] Authorization失效，等待重新登录")
+            # 注意：这里不立即重新登录，而是标记需要重新登录
+            # 实际的重新登录会在下次启动时进行
+            warn = f"[{username}] [积分检查] Authorization失效，需要重新登录：{qmsg} @ {now_str(tz_name)}"
+            print(warn)
+            return {
+                'username': username,
+                'success': False,
+                'message': warn,
+                'points': None,
+                'total_points': None,
+                'lark_webhook': lark_webhook,
+                'feishu_webhook': feishu_webhook,
+                'points_changed': False
+            }
+        
         if accrued is None:
-            warn = f"[{username}] [积分检查] 失败，可能 Authorization 失效：{qmsg} @ {now_str(tz_name)}"
+            warn = f"[{username}] [积分检查] 失败：{qmsg} @ {now_str(tz_name)}"
             print(warn)
             return {
                 'username': username,
@@ -565,11 +804,12 @@ def main() -> None:
     FEISHU_BASE = 'https://open.feishu.cn/open-apis/bot/v2/hook/'
 
     if os.path.exists(args.config_file):
-        users, global_lark, global_feishu = load_config(args.config_file)
+        users, global_lark, global_feishu, captcha_token = load_config(args.config_file)
     else:
         users = []
         global_lark = None
         global_feishu = None
+        captcha_token = None
 
     if not users:
         msg = '未找到有效的用户配置（请提供 config.json 或设置环境变量）'
@@ -588,6 +828,9 @@ def main() -> None:
     args.lark = normalize_webhook(args.lark, LARK_BASE)
     args.feishu = normalize_webhook(args.feishu, FEISHU_BASE)
 
+    # 启动时先进行顺序登录
+    login_users_sequentially(users, captcha_token, args.config_file)
+
     def do_sign_in_flow(trigger: str) -> None:
         """多用户签到流程"""
         print(f"\n=== {trigger} 开始 ===")
@@ -596,7 +839,7 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=min(len(users), 5)) as executor:
             # 提交所有签到任务
             future_to_user = {
-                executor.submit(do_user_sign_in, user, trigger, args.tz): user 
+                executor.submit(do_user_sign_in, user, trigger, args.tz, captcha_token, args.config_file): user 
                 for user in users
             }
             
@@ -605,12 +848,6 @@ def main() -> None:
             for future in as_completed(future_to_user):
                 result = future.result()
                 results.append(result)
-                
-                # 发送分账号推送
-                if result['lark_webhook']:
-                    send_webhook(result['message'], result['lark_webhook'], None)
-                if result['feishu_webhook']:
-                    send_webhook(result['message'], None, result['feishu_webhook'])
         
         # 发送统一推送
         if args.lark or args.feishu:
@@ -644,7 +881,7 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=min(len(users), 5)) as executor:
             # 提交所有积分检查任务
             future_to_user = {
-                executor.submit(do_user_points_check, user, args.tz, False): user 
+                executor.submit(do_user_points_check, user, args.tz, captcha_token, args.config_file, False): user 
                 for user in users
             }
             
@@ -655,13 +892,9 @@ def main() -> None:
                 result = future.result()
                 results.append(result)
                 
-                # 只在积分变更时发送分账号推送
+                # 只在积分变更时收集结果
                 if result.get('points_changed', False):
                     changed_results.append(result)
-                    if result['lark_webhook']:
-                        send_webhook(result['message'], result['lark_webhook'], None)
-                    if result['feishu_webhook']:
-                        send_webhook(result['message'], None, result['feishu_webhook'])
         
         # 只在有积分变更时发送统一推送
         if changed_results and (args.lark or args.feishu):
@@ -703,7 +936,11 @@ def main() -> None:
     print(f"时区: {args.tz}")
     print(f"定时签到: 每天 08:00")
     print(f"积分检查: 每 10 分钟（仅在积分变更时推送通知）")
-    print(f"推送策略: 每日签到完成后 + 积分变更时")
+    print(f"推送策略: 统一推送（每日签到完成后 + 积分变更时）")
+    if captcha_token:
+        print(f"登录方式: 账号密码 + 云码验证码识别")
+    else:
+        print(f"登录方式: Token认证")
     try:
         while True:
             time.sleep(60)
