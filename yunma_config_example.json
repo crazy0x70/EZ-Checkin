@@ -1,0 +1,14 @@
+{
+  "user1": {
+    "username": "user1",
+    "password": "Admin654321",
+    "Authorization": ""
+  },
+  "user2": {
+    "username": "user2",
+    "password": "Admin123456.",
+    "Authorization": ""
+  },
+  "CAPTCHA_TOKEN": "云码token",
+  "LARK_WEBHOOK": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+}
