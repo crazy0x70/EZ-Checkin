@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from threading import Lock
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -22,6 +23,10 @@ LOGIN_URL = 'https://msec.nsfocus.com/backend_api/account/login'
 
 # 积分状态存储文件
 POINTS_STATE_FILE = 'points_state.json'
+
+# 登录节流锁，确保不同用户的登录间隔至少5秒
+_LOGIN_THROTTLE_LOCK = Lock()
+_last_login_timestamp: float = 0.0
 
 
 def load_points_state() -> Dict[str, Dict[str, Any]]:
@@ -105,49 +110,63 @@ def get_captcha() -> Tuple[Optional[str], Optional[str]]:
 
 def login_with_password(username: str, password: str, captcha_token: str) -> Optional[str]:
     """使用账号密码登录"""
-    for attempt in range(1, 11):
-        print(f"[{username}] 第{attempt}次登录尝试")
-        time.sleep(2)
-        
-        # 获取验证码
-        captcha_id, captcha_img = get_captcha()
-        if not captcha_id or not captcha_img:
-            print(f"[{username}] 获取验证码失败")
-            continue
-        
-        # 识别验证码
-        captcha_result = verify_captcha(captcha_token, captcha_img)
-        if not captcha_result:
-            print(f"[{username}] 验证码识别失败")
-            continue
-        
-        print(f"[{username}] 验证码识别成功: {captcha_result}")
-        
-        # 尝试登录
-        login_data = {
-            "captcha_answer": captcha_result,
-            "captcha_id": captcha_id,
-            "password": password,
-            "username": username
-        }
-        
-        try:
-            resp = requests.post(LOGIN_URL, headers=build_headers(""), json=login_data, timeout=10)
-            auth_data = resp.json()
-            
-            if auth_data.get('status') == 200:
-                token = auth_data['data']['token']
-                print(f"[{username}] 登录成功")
-                return token
-            else:
-                print(f"[{username}] 登录失败: {auth_data.get('message', '未知错误')}")
-                continue
-        except Exception as e:
-            print(f"[{username}] 登录请求失败: {e}")
-            continue
+    global _last_login_timestamp
+    token_result: Optional[str] = None
     
-    print(f"[{username}] 登录失败，已尝试10次")
-    return None
+    with _LOGIN_THROTTLE_LOCK:
+        now = time.time()
+        if _last_login_timestamp:
+            wait_seconds = max(0.0, 5.0 - (now - _last_login_timestamp))
+            if wait_seconds > 0:
+                print(f"[{username}] 等待{wait_seconds:.1f}秒后再登录")
+                time.sleep(wait_seconds)
+        
+        for attempt in range(1, 11):
+            print(f"[{username}] 第{attempt}次登录尝试")
+            time.sleep(2)
+            
+            # 获取验证码
+            captcha_id, captcha_img = get_captcha()
+            if not captcha_id or not captcha_img:
+                print(f"[{username}] 获取验证码失败")
+                continue
+            
+            # 识别验证码
+            captcha_result = verify_captcha(captcha_token, captcha_img)
+            if not captcha_result:
+                print(f"[{username}] 验证码识别失败")
+                continue
+            
+            print(f"[{username}] 验证码识别成功: {captcha_result}")
+            
+            # 尝试登录
+            login_data = {
+                "captcha_answer": captcha_result,
+                "captcha_id": captcha_id,
+                "password": password,
+                "username": username
+            }
+            
+            try:
+                resp = requests.post(LOGIN_URL, headers=build_headers(""), json=login_data, timeout=10)
+                auth_data = resp.json()
+                
+                if auth_data.get('status') == 200:
+                    token_result = auth_data['data']['token']
+                    print(f"[{username}] 登录成功")
+                    break
+                else:
+                    print(f"[{username}] 登录失败: {auth_data.get('message', '未知错误')}")
+                    continue
+            except Exception as e:
+                print(f"[{username}] 登录请求失败: {e}")
+                continue
+        
+        _last_login_timestamp = time.time()
+    
+    if not token_result:
+        print(f"[{username}] 登录失败，已尝试10次")
+    return token_result
 
 
 def login_users_sequentially(users: List[Dict[str, str]], captcha_token: Optional[str], config_file: str) -> None:
@@ -172,12 +191,6 @@ def login_users_sequentially(users: List[Dict[str, str]], captcha_token: Optiona
         password = user['password']
         
         print(f"[{i+1}/{len(users_need_login)}] 开始登录用户: {username}")
-        
-        # 登录间隔5秒以上
-        if i > 0:
-            print(f"等待5秒后继续下一个用户登录...")
-            time.sleep(5)
-        
         new_token = login_with_password(username, password, captcha_token)
         if new_token:
             # 更新配置文件中的token
@@ -579,26 +592,62 @@ def do_user_sign_in(user: Dict[str, str], trigger: str, tz_name: str, captcha_to
         }
     
     req_headers = build_headers(authorization)
+    relogin_attempted = False
     
     try:
-        ok, first_msg, first_json = sign_in(req_headers, username)
-        
-        # 检查Authorization是否失效
-        if not ok and first_json and first_json.get('status') in [401, 403]:
-            print(f"[{username}] Authorization失效，等待重新登录")
-            # 注意：这里不立即重新登录，而是标记需要重新登录
-            # 实际的重新登录会在下次启动时进行
-            error_msg = f"[{username}] Authorization失效，需要重新登录"
-            print(error_msg)
-            return {
-                'username': username,
-                'success': False,
-                'message': error_msg,
-                'points': None,
-                'total_points': None,
-                'lark_webhook': lark_webhook,
-                'feishu_webhook': feishu_webhook
-            }
+        while True:
+            ok, first_msg, first_json = sign_in(req_headers, username)
+            
+            # 检查Authorization是否失效
+            if not ok and first_json and first_json.get('status') in [401, 403]:
+                if relogin_attempted:
+                    error_msg = f"[{username}] Authorization仍然失效，请检查账号"
+                    print(error_msg)
+                    return {
+                        'username': username,
+                        'success': False,
+                        'message': error_msg,
+                        'points': None,
+                        'total_points': None,
+                        'lark_webhook': lark_webhook,
+                        'feishu_webhook': feishu_webhook
+                    }
+                
+                if not captcha_token or not user.get('password'):
+                    error_msg = f"[{username}] Authorization失效，但缺少账号密码或云码Token，无法自动重新登录"
+                    print(error_msg)
+                    return {
+                        'username': username,
+                        'success': False,
+                        'message': error_msg,
+                        'points': None,
+                        'total_points': None,
+                        'lark_webhook': lark_webhook,
+                        'feishu_webhook': feishu_webhook
+                    }
+                
+                print(f"[{username}] Authorization失效，尝试自动重新登录")
+                new_token = refresh_user_authorization(user, captcha_token, config_file)
+                if not new_token:
+                    error_msg = f"[{username}] 自动重新登录失败，请检查账号或验证码服务"
+                    print(error_msg)
+                    return {
+                        'username': username,
+                        'success': False,
+                        'message': error_msg,
+                        'points': None,
+                        'total_points': None,
+                        'lark_webhook': lark_webhook,
+                        'feishu_webhook': feishu_webhook
+                    }
+                
+                user['Authorization'] = new_token
+                req_headers = build_headers(new_token)
+                relogin_attempted = True
+                print(f"[{username}] 已重新登录并更新Authorization")
+                time.sleep(1.0)
+                continue
+            break
         
         time.sleep(1.2)
         confirmed, confirm_msg = confirm_signed(req_headers, username)
@@ -684,27 +733,65 @@ def do_user_points_check(user: Dict[str, str], tz_name: str, captcha_token: Opti
         }
     
     req_headers = build_headers(authorization)
+    relogin_attempted = False
     
     try:
-        accrued, total, qmsg = query_points(req_headers, username)
-        
-        # 检查Authorization是否失效（积分查询失败且返回401/403）
-        if accrued is None and ('401' in qmsg or '403' in qmsg):
-            print(f"[{username}] [积分检查] Authorization失效，等待重新登录")
-            # 注意：这里不立即重新登录，而是标记需要重新登录
-            # 实际的重新登录会在下次启动时进行
-            warn = f"[{username}] [积分检查] Authorization失效，需要重新登录：{qmsg} @ {now_str(tz_name)}"
-            print(warn)
-            return {
-                'username': username,
-                'success': False,
-                'message': warn,
-                'points': None,
-                'total_points': None,
-                'lark_webhook': lark_webhook,
-                'feishu_webhook': feishu_webhook,
-                'points_changed': False
-            }
+        while True:
+            accrued, total, qmsg = query_points(req_headers, username)
+            
+            # 检查Authorization是否失效（积分查询失败且返回401/403）
+            if accrued is None and ('401' in qmsg or '403' in qmsg):
+                if relogin_attempted:
+                    warn = f"[{username}] [积分检查] Authorization仍然失效，请检查账号：{qmsg} @ {now_str(tz_name)}"
+                    print(warn)
+                    return {
+                        'username': username,
+                        'success': False,
+                        'message': warn,
+                        'points': None,
+                        'total_points': None,
+                        'lark_webhook': lark_webhook,
+                        'feishu_webhook': feishu_webhook,
+                        'points_changed': False
+                    }
+                
+                if not captcha_token or not user.get('password'):
+                    warn = f"[{username}] [积分检查] Authorization失效，但缺少账号密码或云码Token，无法自动重新登录：{qmsg} @ {now_str(tz_name)}"
+                    print(warn)
+                    return {
+                        'username': username,
+                        'success': False,
+                        'message': warn,
+                        'points': None,
+                        'total_points': None,
+                        'lark_webhook': lark_webhook,
+                        'feishu_webhook': feishu_webhook,
+                        'points_changed': False
+                    }
+                
+                print(f"[{username}] [积分检查] Authorization失效，尝试自动重新登录")
+                new_token = refresh_user_authorization(user, captcha_token, config_file)
+                if not new_token:
+                    warn = f"[{username}] [积分检查] 自动重新登录失败，请检查账号或验证码服务：{qmsg} @ {now_str(tz_name)}"
+                    print(warn)
+                    return {
+                        'username': username,
+                        'success': False,
+                        'message': warn,
+                        'points': None,
+                        'total_points': None,
+                        'lark_webhook': lark_webhook,
+                        'feishu_webhook': feishu_webhook,
+                        'points_changed': False
+                    }
+                
+                user['Authorization'] = new_token
+                req_headers = build_headers(new_token)
+                relogin_attempted = True
+                print(f"[{username}] [积分检查] 已重新登录并更新Authorization")
+                time.sleep(1.0)
+                continue
+            break
         
         if accrued is None:
             warn = f"[{username}] [积分检查] 失败：{qmsg} @ {now_str(tz_name)}"
@@ -950,5 +1037,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
-
