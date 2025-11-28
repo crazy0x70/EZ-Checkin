@@ -12,7 +12,6 @@ from threading import Lock
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 from pytz import timezone
 from urllib.parse import urlparse
 
@@ -24,7 +23,7 @@ LOGIN_URL = 'https://msec.nsfocus.com/backend_api/account/login'
 # 积分状态存储文件
 POINTS_STATE_FILE = 'points_state.json'
 
-# 登录节流锁，确保不同用户的登录间隔至少5秒
+# 登录节流锁，确保不同用户的登录间隔至少10秒
 _LOGIN_THROTTLE_LOCK = Lock()
 _last_login_timestamp: float = 0.0
 
@@ -116,14 +115,16 @@ def login_with_password(username: str, password: str, captcha_token: str) -> Opt
     with _LOGIN_THROTTLE_LOCK:
         now = time.time()
         if _last_login_timestamp:
-            wait_seconds = max(0.0, 5.0 - (now - _last_login_timestamp))
+            wait_seconds = max(0.0, 10.0 - (now - _last_login_timestamp))
             if wait_seconds > 0:
                 print(f"[{username}] 等待{wait_seconds:.1f}秒后再登录")
                 time.sleep(wait_seconds)
         
         for attempt in range(1, 11):
+            if attempt > 1:
+                print(f"[{username}] 等待10秒后重试登录")
+                time.sleep(10)
             print(f"[{username}] 第{attempt}次登录尝试")
-            time.sleep(2)
             
             # 获取验证码
             captcha_id, captcha_img = get_captcha()
@@ -663,15 +664,15 @@ def do_user_sign_in(user: Dict[str, str], trigger: str, tz_name: str, captcha_to
         
         result_text = '签到成功' if final_ok else '签到失败'
         if accrued is not None:
-            points_text = f"积分情况：当前积分{total}, 累计积分{accrued}"
+            points_text = f"积分：当前 {total} ｜ 累计 {accrued}"
         else:
-            points_text = "积分情况：查询失败"
+            points_text = "积分：查询失败"
         
         message = "\n".join([
-            f"用户：{username}",
+            f"👤 用户：{username}",
             f"状态：{status_emoji} {result_text}",
             points_text,
-            f"签到时间：{timestamp}",
+            f"时间：{timestamp}",
         ])
         
         print(message)
@@ -711,146 +712,6 @@ def do_user_sign_in(user: Dict[str, str], trigger: str, tz_name: str, captcha_to
             'feishu_webhook': feishu_webhook
         }
 
-
-def do_user_points_check(user: Dict[str, str], tz_name: str, captcha_token: Optional[str], config_file: str, force_push: bool = False) -> Dict[str, Any]:
-    """单个用户的积分检查"""
-    username = user['username']
-    lark_webhook = user.get('LARK_WEBHOOK', '')
-    feishu_webhook = user.get('FEISHU_WEBHOOK', '')
-    
-    # 获取Authorization（优先使用保存的token）
-    authorization = user['Authorization']
-    if not authorization:
-        return {
-            'username': username,
-            'success': False,
-            'message': f"[{username}] 无有效的 Authorization",
-            'points': None,
-            'total_points': None,
-            'lark_webhook': lark_webhook,
-            'feishu_webhook': feishu_webhook,
-            'points_changed': False
-        }
-    
-    req_headers = build_headers(authorization)
-    relogin_attempted = False
-    
-    try:
-        while True:
-            accrued, total, qmsg = query_points(req_headers, username)
-            
-            # 检查Authorization是否失效（积分查询失败且返回401/403）
-            if accrued is None and ('401' in qmsg or '403' in qmsg):
-                if relogin_attempted:
-                    warn = f"[{username}] [积分检查] Authorization仍然失效，请检查账号：{qmsg} @ {now_str(tz_name)}"
-                    print(warn)
-                    return {
-                        'username': username,
-                        'success': False,
-                        'message': warn,
-                        'points': None,
-                        'total_points': None,
-                        'lark_webhook': lark_webhook,
-                        'feishu_webhook': feishu_webhook,
-                        'points_changed': False
-                    }
-                
-                if not captcha_token or not user.get('password'):
-                    warn = f"[{username}] [积分检查] Authorization失效，但缺少账号密码或云码Token，无法自动重新登录：{qmsg} @ {now_str(tz_name)}"
-                    print(warn)
-                    return {
-                        'username': username,
-                        'success': False,
-                        'message': warn,
-                        'points': None,
-                        'total_points': None,
-                        'lark_webhook': lark_webhook,
-                        'feishu_webhook': feishu_webhook,
-                        'points_changed': False
-                    }
-                
-                print(f"[{username}] [积分检查] Authorization失效，尝试自动重新登录")
-                new_token = refresh_user_authorization(user, captcha_token, config_file)
-                if not new_token:
-                    warn = f"[{username}] [积分检查] 自动重新登录失败，请检查账号或验证码服务：{qmsg} @ {now_str(tz_name)}"
-                    print(warn)
-                    return {
-                        'username': username,
-                        'success': False,
-                        'message': warn,
-                        'points': None,
-                        'total_points': None,
-                        'lark_webhook': lark_webhook,
-                        'feishu_webhook': feishu_webhook,
-                        'points_changed': False
-                    }
-                
-                user['Authorization'] = new_token
-                req_headers = build_headers(new_token)
-                relogin_attempted = True
-                print(f"[{username}] [积分检查] 已重新登录并更新Authorization")
-                time.sleep(1.0)
-                continue
-            break
-        
-        if accrued is None:
-            warn = f"[{username}] [积分检查] 失败：{qmsg} @ {now_str(tz_name)}"
-            print(warn)
-            return {
-                'username': username,
-                'success': False,
-                'message': warn,
-                'points': None,
-                'total_points': None,
-                'lark_webhook': lark_webhook,
-                'feishu_webhook': feishu_webhook,
-                'points_changed': False
-            }
-        else:
-            # 检查积分是否发生变化
-            points_changed = check_points_changed(username, accrued, total)
-            
-            if points_changed or force_push:
-                message = f"[{username}] [积分检查] 当前 {total}, 累计 {accrued} @ {now_str(tz_name)}"
-                if points_changed:
-                    message += " (积分已更新)"
-                print(message)
-                return {
-                    'username': username,
-                    'success': True,
-                    'message': message,
-                    'points': accrued,
-                    'total_points': total,
-                    'lark_webhook': lark_webhook,
-                    'feishu_webhook': feishu_webhook,
-                    'points_changed': points_changed
-                }
-            else:
-                # 积分未变化，只记录日志，不推送
-                print(f"[{username}] [积分检查] 积分无变化: 当前 {total}, 累计 {accrued} @ {now_str(tz_name)}")
-                return {
-                    'username': username,
-                    'success': True,
-                    'message': f"[{username}] [积分检查] 积分无变化: 当前 {total}, 累计 {accrued}",
-                    'points': accrued,
-                    'total_points': total,
-                    'lark_webhook': lark_webhook,
-                    'feishu_webhook': feishu_webhook,
-                    'points_changed': False
-                }
-    except Exception as e:
-        warn = f"[{username}] [积分检查] 异常：{e} @ {now_str(tz_name)}"
-        print(warn)
-        return {
-            'username': username,
-            'success': False,
-            'message': warn,
-            'points': None,
-            'total_points': None,
-            'lark_webhook': lark_webhook,
-            'feishu_webhook': feishu_webhook,
-            'points_changed': False
-        }
 
 
 def main() -> None:
@@ -941,74 +802,30 @@ def main() -> None:
             success_count = sum(1 for r in results if r['success'])
             total_count = len(results)
             
-            summary_message = f"签到汇总：{success_count}/{total_count} 成功\n\n"
+            lines = [
+                "📅 M-SEC 每日签到汇总",
+                f"时间：{now_str(args.tz)}",
+                f"结果：{success_count}/{total_count} 成功",
+                "------------------------------",
+            ]
             
             for result in results:
                 status_emoji = '✅' if result['success'] else '❌'
-                result_text = '签到成功' if result['success'] else '签到失败'
-                summary_message += f"{result['username']}：\n"
-                summary_message += f"状态：{status_emoji} {result_text}\n"
+                result_text = '成功' if result['success'] else '失败'
                 if result['points'] is not None:
-                    summary_message += f"积分情况：当前积分{result['total_points']}, 累计积分{result['points']}\n"
+                    points_text = f"积分：当前 {result['total_points']} ｜ 累计 {result['points']}"
                 else:
-                    summary_message += "积分情况：查询失败\n"
-                summary_message += "\n"
+                    points_text = "积分：查询失败"
+                
+                lines.append(f"{status_emoji} {result['username']} - {result_text}")
+                lines.append(points_text)
             
-            summary_message += f"完成时间：{now_str(args.tz)}"
+            lines.append("感谢使用，祝好 🙌")
+            summary_message = "\n".join(lines)
             
             send_webhook(summary_message, args.lark, args.feishu)
         
         print(f"=== {trigger} 完成 ===\n")
-
-    def do_points_check() -> None:
-        """多用户积分检查（只在积分变更时推送）"""
-        print(f"\n=== 积分检查 开始 ===")
-        
-        # 使用线程池并发处理所有用户
-        with ThreadPoolExecutor(max_workers=min(len(users), 5)) as executor:
-            # 提交所有积分检查任务
-            future_to_user = {
-                executor.submit(do_user_points_check, user, args.tz, captcha_token, args.config_file, False): user 
-                for user in users
-            }
-            
-            # 收集结果
-            results = []
-            changed_results = []
-            for future in as_completed(future_to_user):
-                result = future.result()
-                results.append(result)
-                
-                # 只在积分变更时收集结果
-                if result.get('points_changed', False):
-                    changed_results.append(result)
-        
-        # 只在有积分变更时发送统一推送
-        if changed_results and (args.lark or args.feishu):
-            success_count = sum(1 for r in changed_results if r['success'])
-            total_count = len(changed_results)
-            
-            summary_message = f"积分变更通知：{success_count}/{total_count} 用户积分已更新\n\n"
-            
-            for result in changed_results:
-                status_emoji = '✅' if result['success'] else '❌'
-                result_text = '更新成功' if result['success'] else '更新失败'
-                summary_message += f"{result['username']}：\n"
-                summary_message += f"状态：{status_emoji} {result_text}\n"
-                if result['points'] is not None:
-                    summary_message += f"积分情况：当前积分{result['total_points']}, 累计积分{result['points']}\n"
-                else:
-                    summary_message += "积分情况：查询失败\n"
-                summary_message += "\n"
-            
-            summary_message += f"更新时间：{now_str(args.tz)}"
-            
-            send_webhook(summary_message, args.lark, args.feishu)
-        
-        if changed_results:
-            print(f"=== 积分检查完成，{len(changed_results)} 个用户积分已更新 ===\n")
-        else:
-            print(f"=== 积分检查完成，无积分变更 ===\n")
 
     # 启动时执行一次签到
     do_sign_in_flow('启动签到')
@@ -1016,14 +833,12 @@ def main() -> None:
     # 设置定时任务
     sched = BackgroundScheduler(timezone=timezone(args.tz))
     sched.add_job(lambda: do_sign_in_flow('定时签到'), CronTrigger(hour=8, minute=0))
-    sched.add_job(do_points_check, IntervalTrigger(minutes=10))
     sched.start()
 
     print(f"多用户签到服务已启动，共 {len(users)} 个用户")
     print(f"时区: {args.tz}")
     print(f"定时签到: 每天 08:00")
-    print(f"积分检查: 每 10 分钟（仅在积分变更时推送通知）")
-    print(f"推送策略: 统一推送（每日签到完成后 + 积分变更时）")
+    print(f"推送策略: 统一推送（仅每日签到完成后）")
     if captcha_token:
         print(f"登录方式: 账号密码 + 云码验证码识别")
     else:
